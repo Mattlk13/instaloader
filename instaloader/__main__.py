@@ -5,14 +5,15 @@ import datetime
 import os
 import re
 import sys
-from argparse import ArgumentParser, SUPPRESS
+from argparse import ArgumentParser, ArgumentTypeError, SUPPRESS
 from typing import List, Optional
 
-from . import (Instaloader, InstaloaderException, InvalidArgumentException, Post, Profile, ProfileNotExistsException,
-               StoryItem, __version__, load_structure_from_file, TwoFactorAuthRequiredException,
-               BadCredentialsException)
-from .instaloader import get_default_session_filename
+from . import (AbortDownloadException, BadCredentialsException, Instaloader, InstaloaderException,
+               InvalidArgumentException, Post, Profile, ProfileNotExistsException, StoryItem,
+               TwoFactorAuthRequiredException, __version__, load_structure_from_file)
+from .instaloader import (get_default_session_filename, get_default_stamps_filename)
 from .instaloadercontext import default_user_agent
+from .lateststamps import LatestStamps
 
 
 def usage_string():
@@ -25,6 +26,14 @@ def usage_string():
 {2:{1}} [--login YOUR-USERNAME] [--fast-update]
 {2:{1}} profile | "#hashtag" | %%location_id | :stories | :feed | :saved
 {0} --help""".format(argv0, len(argv0), '')
+
+
+def http_status_code_list(code_list_str: str) -> List[int]:
+    codes = [int(s) for s in code_list_str.split(',')]
+    for code in codes:
+        if not 100 <= code <= 599:
+            raise ArgumentTypeError("Invalid HTTP status code: {}".format(code))
+    return codes
 
 
 def filterstr_to_filterfunc(filter_str: str, item_type: type):
@@ -68,6 +77,7 @@ def _main(instaloader: Instaloader, targetlist: List[str],
           download_tagged: bool = False,
           download_igtv: bool = False,
           fast_update: bool = False,
+          latest_stamps_file: Optional[str] = None,
           max_count: Optional[int] = None, post_filter_str: Optional[str] = None,
           storyitem_filter_str: Optional[str] = None) -> None:
     """Download set of profiles, hashtags etc. and handle logging in and session files if desired."""
@@ -80,6 +90,10 @@ def _main(instaloader: Instaloader, targetlist: List[str],
     if storyitem_filter_str is not None:
         storyitem_filter = filterstr_to_filterfunc(storyitem_filter_str, StoryItem)
         instaloader.context.log('Only download storyitems with property "{}".'.format(storyitem_filter_str))
+    latest_stamps = None
+    if latest_stamps_file is not None:
+        latest_stamps = LatestStamps(latest_stamps_file)
+        instaloader.context.log(f"Using latest stamps from {latest_stamps_file}.")
     # Login, if desired
     if username is not None:
         if not re.match(r"^[A-Za-z0-9._]+$", username):
@@ -100,7 +114,8 @@ def _main(instaloader: Instaloader, targetlist: List[str],
                             code = input("Enter 2FA verification code: ")
                             instaloader.two_factor_login(code)
                             break
-                        except BadCredentialsException:
+                        except BadCredentialsException as err:
+                            print(err, file=sys.stderr)
                             pass
             else:
                 instaloader.interactive_login(username)
@@ -164,7 +179,7 @@ def _main(instaloader: Instaloader, targetlist: List[str],
                                                      post_filter=post_filter)
                 elif re.match(r"^[A-Za-z0-9._]+$", target):
                     try:
-                        profile = instaloader.check_profile_id(target)
+                        profile = instaloader.check_profile_id(target, latest_stamps)
                         if instaloader.context.is_logged_in and profile.has_blocked_viewer:
                             if download_profile_pic or ((download_posts or download_tagged or download_igtv)
                                                         and not profile.is_private):
@@ -183,7 +198,8 @@ def _main(instaloader: Instaloader, targetlist: List[str],
                             instaloader.context.log("Trying again anonymously, helps in case you are just blocked.")
                             with instaloader.anonymous_copy() as anonymous_loader:
                                 with instaloader.context.error_catcher():
-                                    anonymous_retry_profiles.add(anonymous_loader.check_profile_id(target))
+                                    anonymous_retry_profiles.add(anonymous_loader.check_profile_id(target,
+                                                                                                   latest_stamps))
                                     instaloader.context.error("Warning: {} will be downloaded anonymously (\"{}\")."
                                                               .format(target, err))
                         else:
@@ -198,21 +214,25 @@ def _main(instaloader: Instaloader, targetlist: List[str],
         if len(profiles) > 1:
             instaloader.context.log("Downloading {} profiles: {}".format(len(profiles),
                                                                          ' '.join([p.username for p in profiles])))
-        if profiles and (download_profile_pic or download_posts) and not instaloader.context.is_logged_in:
-            instaloader.context.error("Warning: Use --login to download higher-quality versions of pictures.")
+        if instaloader.context.iphone_support and profiles and (download_profile_pic or download_posts) and \
+           not instaloader.context.is_logged_in:
+            instaloader.context.log("Hint: Use --login to download higher-quality versions of pictures.")
         instaloader.download_profiles(profiles,
                                       download_profile_pic, download_posts, download_tagged, download_igtv,
                                       download_highlights, download_stories,
-                                      fast_update, post_filter, storyitem_filter)
+                                      fast_update, post_filter, storyitem_filter, latest_stamps=latest_stamps)
         if anonymous_retry_profiles:
             instaloader.context.log("Downloading anonymously: {}"
                                     .format(' '.join([p.username for p in anonymous_retry_profiles])))
             with instaloader.anonymous_copy() as anonymous_loader:
                 anonymous_loader.download_profiles(anonymous_retry_profiles,
                                                    download_profile_pic, download_posts, download_tagged, download_igtv,
-                                                   fast_update=fast_update, post_filter=post_filter)
+                                                   fast_update=fast_update, post_filter=post_filter,
+                                                   latest_stamps=latest_stamps)
     except KeyboardInterrupt:
         print("\nInterrupted by user.", file=sys.stderr)
+    except AbortDownloadException as exc:
+        print("\nDownload aborted: {}.".format(exc), file=sys.stderr)
     # Save session if it is useful
     if instaloader.context.is_logged_in:
         instaloader.save_session_to_file(sessionfile)
@@ -267,6 +287,8 @@ def main():
                         help="Do not download regular posts.")
     g_prof.add_argument('--no-profile-pic', action='store_true',
                         help='Do not download profile picture.')
+    g_post.add_argument('--slide', action='store',
+                        help='Set what image/interval of a sidecar you want to download.')
     g_post.add_argument('--no-pictures', action='store_true',
                         help='Do not download post pictures. Cannot be used together with --fast-update. '
                              'Implies --no-video-thumbnails, does not imply --no-videos.')
@@ -311,7 +333,10 @@ def main():
     g_cond.add_argument('-F', '--fast-update', action='store_true',
                         help='For each target, stop when encountering the first already-downloaded picture. This '
                              'flag is recommended when you use Instaloader to update your personal Instagram archive.')
-
+    g_cond.add_argument('--latest-stamps', nargs='?', metavar='STAMPSFILE', const=get_default_stamps_filename(),
+                        help='Store the timestamps of latest media scraped for each profile. This allows updating '
+                             'your personal Instagram archive even if you delete the destination directories. '
+                             'If STAMPSFILE is not provided, defaults to ' + get_default_stamps_filename())
     g_cond.add_argument('--post-filter', '--only-if', metavar='filter',
                         help='Expression that, if given, must evaluate to True for each post to be downloaded. Must be '
                              'a syntactically valid python expression. Variables are evaluated to '
@@ -323,7 +348,7 @@ def main():
 
     g_cond.add_argument('-c', '--count',
                         help='Do not attempt to download more than COUNT posts. '
-                             'Applies only to #hashtag and :feed.')
+                             'Applies to #hashtag, %%location_id, :feed, and :saved.')
 
     g_login = parser.add_argument_group('Login (Download Private Profiles)',
                                         'Instaloader can login to Instagram. This allows downloading private profiles. '
@@ -346,10 +371,15 @@ def main():
                             '{target} is replaced by the target you specified, i.e. either :feed, #hashtag or the '
                             'profile name. Defaults to \'{target}\'.')
     g_how.add_argument('--filename-pattern',
-                       help='Prefix of filenames, relative to the directory given with '
+                       help='Prefix of filenames for posts and stories, relative to the directory given with '
                             '--dirname-pattern. {profile} is replaced by the profile name,'
                             '{target} is replaced by the target you specified, i.e. either :feed'
                             '#hashtag or the profile name. Defaults to \'{date_utc}_UTC\'')
+    g_how.add_argument('--title-pattern',
+                       help='Prefix of filenames for profile pics, hashtag profile pics, and highlight covers. '
+                            'Defaults to \'{date_utc}_UTC_{typename}\' if --dirname-pattern contains \'{target}\' '
+                            'or \'{dirname}\', or if --dirname-pattern is not specified. Otherwise defaults to '
+                            '\'{target}_{date_utc}_UTC_{typename}\'.')
     g_how.add_argument('--resume-prefix', metavar='PREFIX',
                        help='Prefix for filenames that are used to save the information to resume an interrupted '
                             'download.')
@@ -365,8 +395,13 @@ def main():
                             'connection fails, it can be manually skipped by hitting CTRL+C. Set this to 0 to retry '
                             'infinitely.')
     g_how.add_argument('--commit-mode', action='store_true', help=SUPPRESS)
-    g_how.add_argument('--request-timeout', metavar='N', type=float,
-                       help='seconds to wait before timing out a connection request')
+    g_how.add_argument('--request-timeout', metavar='N', type=float, default=300.0,
+                       help='Seconds to wait before timing out a connection request. Defaults to 300.')
+    g_how.add_argument('--abort-on', type=http_status_code_list, metavar="STATUS_CODES",
+                       help='Comma-separated list of HTTP status codes that cause Instaloader to abort, bypassing all '
+                            'retry logic.')
+    g_how.add_argument('--no-iphone', action='store_true',
+                        help='Do not attempt to download iPhone version of images and videos.')
 
     g_misc = parser.add_argument_group('Miscellaneous Options')
     g_misc.add_argument('-q', '--quiet', action='store_true',
@@ -424,7 +459,11 @@ def main():
                              max_connection_attempts=args.max_connection_attempts,
                              request_timeout=args.request_timeout,
                              resume_prefix=resume_prefix,
-                             check_resume_bbd=not args.use_aged_resume_files)
+                             check_resume_bbd=not args.use_aged_resume_files,
+                             slide=args.slide,
+                             fatal_status_codes=args.abort_on,
+                             iphone_support=not args.no_iphone,
+                             title_pattern=args.title_pattern)
         _main(loader,
               args.profile,
               username=args.login.lower() if args.login is not None else None,
@@ -437,12 +476,13 @@ def main():
               download_tagged=args.tagged,
               download_igtv=args.igtv,
               fast_update=args.fast_update,
+              latest_stamps_file=args.latest_stamps,
               max_count=int(args.count) if args.count is not None else None,
               post_filter_str=args.post_filter,
               storyitem_filter_str=args.storyitem_filter)
         loader.close()
     except InstaloaderException as err:
-        raise SystemExit("Fatal error: %s" % err)
+        raise SystemExit("Fatal error: %s" % err) from err
 
 
 if __name__ == "__main__":

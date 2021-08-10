@@ -82,6 +82,16 @@ What to Download of each Post
    Template to write in txt file for each StoryItem. See
    :ref:`metadata-text-files`.
 
+.. option:: --slide
+
+   Download only selected images of a sidecar. You can select single images using their
+   index in the sidecar starting with the leftmost or you can specify a range of images
+   with the following syntax: ``start_index-end_index``. Example:
+   ``--slide 1`` will select only the first image, ``--slide last`` only the last one and ``--slide 1-3`` will select only
+   the first three images.
+
+   .. versionadded:: 4.6
+
 .. option:: --no-metadata-json
 
    Do not create a JSON file containing the metadata of each post.
@@ -89,7 +99,6 @@ What to Download of each Post
 .. option:: --no-compress-json
 
    Do not xz compress JSON files, rather create pretty formatted JSONs.
-
 
 What to Download of each Profile
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -137,6 +146,23 @@ Which Posts to Download
    This flag is recommended when you use Instaloader to update your personal
    Instagram archive.
 
+.. option:: --latest-stamps [STAMPSFILE]
+
+   Works similarly to :option:`--fast-update`, but instead of relying on already
+   downloaded media, the time each profile was downloaded is stored, and only
+   media newer than the last download is fetched. This allows updating your
+   personal Instagram archive while emptying the target directories.
+
+   Only works for media associated with a specific profile, and that is returned
+   in chronological order: profile posts, profile stories, profile IGTV posts
+   and profile tagged posts.
+
+   By default, the information is stored in
+   ``~/.config/instaloader/latest-stamps.ini``, but you can specify an
+   alternative location.
+
+   .. versionadded:: 4.8
+
 .. option:: --post-filter filter, --only-if filter
 
    Expression that, if given, must evaluate to True for each post to be
@@ -154,8 +180,8 @@ Which Posts to Download
 
 .. option:: --count COUNT, -c
 
-   Do not attempt to download more than COUNT posts.  Applies only to
-   ``#hashtag``, ``%location id``, and ``:feed``.
+   Do not attempt to download more than COUNT posts.  Applies to
+   ``#hashtag``, ``%location_id``, ``:feed``, and ``:saved``.
 
 
 Login (Download Private Profiles)
@@ -196,11 +222,22 @@ How to Download
 
 .. option:: --filename-pattern FILENAME_PATTERN
 
-   Prefix of filenames, relative to the directory given with
+   Prefix of filenames for posts and stories, relative to the directory given with
    :option:`--dirname-pattern`. ``{profile}`` is replaced by the profile name,
    ``{target}`` is replaced by the target you specified, i.e.  either ``:feed``,
    ``#hashtag`` or the profile name. Defaults to ``{date_utc}_UTC``.
    See :ref:`filename-specification` for a list of supported tokens.
+
+.. option:: --title-pattern TITLE_PATTERN
+
+   Prefix of filenames for profile pics, hashtag profile pics, and highlight
+   covers, relative to the directory given with :option:`--dirname-pattern`.
+   Defaults to ``{date_utc}_UTC_{typename}`` if :option:`--dirname-pattern`
+   contains ``{target}`` or ``{profile}``, otherwise defaults to
+   ``{target}_{date_utc}_UTC_{typename}``.
+   See :ref:`filename-specification` for a list of supported tokens.
+
+   .. versionadded:: 4.8
 
 .. option:: --resume-prefix prefix
 
@@ -210,11 +247,19 @@ How to Download
    used to save the information to resume an interrupted download.  The default
    prefix is ``iterator``.
 
-   Resuming an interrupted download is supported for most, but not all targets.
+   Resuming an interrupted download is supported for the following targets:
+    - Profile posts,
+    - Profile IGTV posts (:option:`--igtv`),
+    - Profile tagged posts (:option:`--tagged`),
+    - Saved posts (``:saved``).
+
+   This feature is enabled by default for targets where it is supported;
+   :option:`--resume-prefix` only changes the name of the iterator files.
+
+   To turn this feature off, use :option:`--no-resume`.
+
    JSON files with resume information are always compressed, regardless of
    :option:`--no-compress-json`.
-
-   This feature is turned off entirely with :option:`--no-resume`.
 
    .. versionadded:: 4.5
 
@@ -228,7 +273,7 @@ How to Download
 .. option:: --user-agent USER_AGENT
 
    User Agent to use for HTTP requests. Per default, Instaloader pretends being
-   Chrome/51.
+   Chrome/89 on Linux.
 
 .. option:: --max-connection-attempts N
 
@@ -238,9 +283,29 @@ How to Download
 
 .. option:: --request-timeout N
 
-   Seconds to wait before timing out a connection request.
+   Seconds to wait before timing out a connection request. Defaults to 300.
 
    .. versionadded:: 4.3
+
+   .. versionchanged:: 4.6
+      Enabled this option by default with a timeout of 300 seconds.
+
+.. option:: --abort-on STATUS_CODE_LIST
+
+   Comma-separated list of HTTP status codes that cause Instaloader to abort,
+   bypassing all retry logic.
+
+   For example, with ``--abort-on=302,400,429``, Instaloader will stop if a
+   request is responded with a 302 redirect, a Bad Request error, or a Too Many
+   Requests error.
+
+   .. versionadded:: 4.7
+
+.. option:: --no-iphone
+
+   Do not attempt to download iPhone version of images and videos.
+
+   .. versionadded:: 4.8
 
 Miscellaneous Options
 ^^^^^^^^^^^^^^^^^^^^^
