@@ -39,6 +39,16 @@ To later **update your local copy** of that profiles, you may run
 If :option:`--fast-update` is given, Instaloader stops when arriving at the
 first already-downloaded picture.
 
+Alternatively, you can use :option:`--latest-stamps` to have Instaloader store
+the time each profile was last downloaded and only download newer media:
+
+::
+
+    instaloader --latest-stamps -- profile [profile ...]
+
+With this option it's possible to move or delete downloaded media and still keep
+the archive updated.
+
 When updating profiles, Instaloader
 automatically **detects profile name changes** and renames the target directory
 accordingly.
@@ -65,7 +75,7 @@ What to Download
 Instaloader supports the following targets:
 
 - ``profile``
-   Public profile, or private profile with :option:`--login`.
+   Public profile, or private profile with :ref:`login<login>`.
 
    If an already-downloaded profile has been renamed, Instaloader automatically
    finds it by its unique ID and renames the folder accordingly.
@@ -82,37 +92,41 @@ Instaloader supports the following targets:
    - :option:`--tagged`
       to **download posts where the user is tagged**, and
 
+   - :option:`--reels`
+      to **download Reels videos**.
+
    - :option:`--igtv`
       to **download IGTV videos**.
 
 - ``"#hashtag"``
-   Posts with a certain **hashtag** (the quotes are usually necessary).
+   Posts with a certain **hashtag** (the quotes are usually necessary). Requires :ref:`login<login>`.
 
 - ``%location id``
    Posts tagged with a given location; the location ID is the numerical ID
    Instagram labels a location with (e.g.
    \https://www.instagram.com/explore/locations/**362629379**/plymouth-naval-memorial/).
-   Requires :option:`--login`.
+   Requires :ref:`login<login>`.
 
    .. versionadded:: 4.2
 
 - ``:stories``
    The currently-visible **stories** of your followees (requires
-   :option:`--login`).
+   :ref:`login<login>`).
 
 - ``:feed``
-   Your **feed** (requires :option:`--login`).
+   Your **feed** (requires :ref:`login<login>`).
 
 - ``:saved``
-   Posts which are marked as **saved** (requires :option:`--login`).
+   Posts which are marked as **saved** (requires :ref:`login<login>`).
 
 - ``@profile``
    All profiles that are followed by ``profile``, i.e. the *followees* of
-   ``profile`` (requires :option:`--login`).
+   ``profile`` (requires :ref:`login<login>`).
 
 - ``-post``
    Replace **post** with the post's shortcode to download single post. Must be preceded by ``--`` in
-   the argument list to not be mistaken as an option flag::
+   the argument list to not be mistaken as an option flag.  For example, to download the post
+   https://www.instagram.com/p/**B_K4CykAOtf**, run the command::
 
     instaloader -- -B_K4CykAOtf
 
@@ -130,7 +144,7 @@ downloads the pictures and videos and their captions. You can specify
 
 - :option:`--geotags`
    **download geotags** of each post and save them as
-   Google Maps link (requires :option:`--login`),
+   Google Maps link (requires :ref:`login<login>`),
 
 For a reference of all supported command line options, see
 :ref:`command-line-options`.
@@ -149,27 +163,40 @@ target. The default is ``--dirname-pattern={target}``. In the dirname
 pattern, the token ``{target}`` is replaced by the target name, and
 ``{profile}`` is replaced by the owner of the post which is downloaded.
 
-:option:`--filename-pattern` configures the path of the post's files relative
+:option:`--filename-pattern` configures the path of the post and story's files relative
 to the target directory that is specified with :option:`--dirname-pattern`.
 The default is ``--filename-pattern={date_utc}_UTC``.
 The tokens ``{target}`` and ``{profile}`` are replaced like in the
-dirname pattern. The following tokens are defined for usage with
-:option:`--filename-pattern`:
+dirname pattern.
+
+:option:`--title-pattern` is similar to :option:`--filename-pattern`, but for profile
+pics, hashtag profile pics, and highlight covers. The default is
+``{date_utc}_UTC_{typename}`` if :option:`--dirname-pattern` contains ``{target}`` or
+``{profile}``, or ``{target}_{date_utc}_UTC_{typename}`` if it does not. Some tokens
+are not supported for this option, see below for details.
+
+The following tokens are defined for usage with
+:option:`--filename-pattern` and :option:`--title-pattern`:
 
 - ``{target}``
    Target name (as given in Instaloader command line)
 
 - ``{profile}`` (same as ``{owner_username}``)
-   Owner of the Post / StoryItem.
+   Owner of the Post / StoryItem / ProfilePic. For hashtag profile pics and
+   highlight covers, equivalent to ``{target}``.
 
 - ``{owner_id}``
-   Unique integer ID of owner profile.
+   Unique integer ID of owner profile. For hashtag profile pics, equivalent to
+   ``{target}``.
 
 - ``{shortcode}``
-   Shortcode (identifier string).
+   Shortcode (identifier string). Not available for :option:`--title-pattern`.
 
 - ``{mediaid}``
-   Integer representation of shortcode.
+   Integer representation of shortcode. Not available for :option:`--title-pattern`.
+
+- ``{filename}``
+   Instagram's internal filename.
 
 - ``{date_utc}`` (same as ``{date}``)
    Creation time in UTC timezone.
@@ -178,6 +205,10 @@ dirname pattern. The following tokens are defined for usage with
    Instaloader is::
 
       {date_utc:%Y-%m-%d_%H-%M-%S}
+
+- ``{typename}``
+   Type of media being saved, such as GraphImage, GraphStoryVideo, profile_pic,
+   etc.
 
 For example, encode the poster's profile name in the filenames with::
 
@@ -204,7 +235,7 @@ The filter string must be a
 where the attributes from :class:`Post` or
 :class:`StoryItem` respectively are defined.
 
-Id est, the following attributes can be used with both
+The following attributes can be used with both
 :option:`--post-filter` and :option:`--storyitem-filter`:
 
 - :attr:`~Post.owner_username` (str), :attr:`~Post.owner_id` (int)
@@ -228,7 +259,7 @@ Id est, the following attributes can be used with both
 As :option:`--post-filter`, the following attributes can be used additionally:
 
 - :attr:`~Post.viewer_has_liked` (bool)
-   Whether user (with :option:`--login`) has liked given post. To download the
+   Whether user (with :ref:`login<login>`) has liked given post. To download the
    pictures from your feed that you have liked::
 
       instaloader --login=your_username --post-filter=viewer_has_liked :feed
@@ -280,12 +311,46 @@ the post's caption::
 
    instaloader --post-metadata-txt="{likes} likes." <target>
 
-Note that with this feature, it is possible to easily and fastly extract
+Note that with this feature, it is possible to easily and quickly extract
 additional metadata of already-downloaded posts, by reimporting their JSON
 files. Say, you now also want to export the number of comments the Posts had
 when they were downloaded::
 
    instaloader --post-metadata-txt="{likes} likes, {comments} comments." <target>/*.json.xz
+
+.. _exit_codes:
+
+Exit codes
+^^^^^^^^^^
+
+Different exit codes are used to indicate different kinds of error:
+
+0
+  No error, all downloads were successful.
+
+1
+  A non-fatal error happened. One or more posts, or even one or more
+  profiles could not be downloaded, but execution was not stopped. The
+  errors are repeated at the end of the log for easy access.
+
+2
+  Command-line error. An unrecognized option was passed, or an invalid
+  combination of options, for example. No interaction with Instagram
+  was made.
+
+3
+  Login error. It was not possible to login. Downloads were not
+  attempted.
+
+4
+  Fatal download error. Downloads were interrupted and no further
+  attempts were made. Happens when a response with one of the status
+  codes in the :option:`--abort-on` option were passed, or when
+  Instagram logs the user out during downloads.
+
+5
+  Interrupted by the user. Happens when the user presses Control-C or
+  sends SIGINT to the process.
 
 .. _instaloader-as-cronjob:
 

@@ -10,33 +10,40 @@ import tempfile
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from functools import wraps
-from hashlib import md5
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, IO, Iterator, List, Optional, Set, Union, cast
+from urllib.parse import urlparse
 
 import requests
 import urllib3  # type: ignore
 
 from .exceptions import *
 from .instaloadercontext import InstaloaderContext, RateController
+from .lateststamps import LatestStamps
 from .nodeiterator import NodeIterator, resumable_iteration
+from .sectioniterator import SectionIterator
 from .structures import (Hashtag, Highlight, JsonExportable, Post, PostLocation, Profile, Story, StoryItem,
-                         load_structure_from_file, save_structure_to_file)
+                         load_structure_from_file, save_structure_to_file, PostSidecarNode, TitlePic)
+
+
+def _get_config_dir() -> str:
+    if platform.system() == "Windows":
+        # on Windows, use %LOCALAPPDATA%\Instaloader
+        localappdata = os.getenv("LOCALAPPDATA")
+        if localappdata is not None:
+            return os.path.join(localappdata, "Instaloader")
+        # legacy fallback - store in temp dir if %LOCALAPPDATA% is not set
+        return os.path.join(tempfile.gettempdir(), ".instaloader-" + getpass.getuser())
+    # on Unix, use ~/.config/instaloader
+    return os.path.join(os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "instaloader")
 
 
 def get_default_session_filename(username: str) -> str:
     """Returns default session filename for given username."""
+    configdir = _get_config_dir()
     sessionfilename = "session-{}".format(username)
-    if platform.system() == "Windows":
-        # on Windows, use %LOCALAPPDATA%\Instaloader\session-USERNAME
-        localappdata = os.getenv("LOCALAPPDATA")
-        if localappdata is not None:
-            return os.path.join(localappdata, "Instaloader", sessionfilename)
-        # legacy fallback - store in temp dir if %LOCALAPPDATA% is not set
-        return os.path.join(tempfile.gettempdir(), ".instaloader-" + getpass.getuser(), sessionfilename)
-    # on Unix, use ~/.config/instaloader/session-USERNAME
-    return os.path.join(os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "instaloader", sessionfilename)
+    return os.path.join(configdir, sessionfilename)
 
 
 def get_legacy_session_filename(username: str) -> str:
@@ -44,6 +51,17 @@ def get_legacy_session_filename(username: str) -> str:
     dirname = tempfile.gettempdir() + "/" + ".instaloader-" + getpass.getuser()
     filename = dirname + "/" + "session-" + username
     return filename.lower()
+
+
+def get_default_stamps_filename() -> str:
+    """
+    Returns default filename for latest stamps database.
+
+    .. versionadded:: 4.8
+
+    """
+    configdir = _get_config_dir()
+    return os.path.join(configdir, "latest-stamps.ini")
 
 
 def format_string_contains_key(format_string: str, key: str) -> bool:
@@ -59,13 +77,13 @@ def _requires_login(func: Callable) -> Callable:
     @wraps(func)
     def call(instaloader, *args, **kwargs):
         if not instaloader.context.is_logged_in:
-            raise LoginRequiredException("--login=USERNAME required.")
+            raise LoginRequiredException("Login required.")
         return func(instaloader, *args, **kwargs)
     return call
 
 
 def _retry_on_connection_error(func: Callable) -> Callable:
-    """Decorator to retry the function max_connection_attemps number of times.
+    """Decorator to retry the function max_connection_attempts number of times.
 
     Herewith-decorated functions need an ``_attempt`` keyword argument.
 
@@ -101,6 +119,8 @@ class _ArbitraryItemFormatter(string.Formatter):
 
     def get_value(self, key, args, kwargs):
         """Override to substitute {ATTRIBUTE} by attributes of our _item."""
+        if key == 'filename' and isinstance(self._item, (Post, StoryItem, PostSidecarNode, TitlePic)):
+            return "{filename}"
         if hasattr(self._item, key):
             return getattr(self._item, key)
         return super().get_value(key, args, kwargs)
@@ -117,20 +137,38 @@ class _ArbitraryItemFormatter(string.Formatter):
 
 
 class _PostPathFormatter(_ArbitraryItemFormatter):
+    RESERVED: set = {'CON', 'PRN', 'AUX', 'NUL',
+                     'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+                     'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
+
+    def __init__(self, item: Any, force_windows_path: bool = False):
+        super().__init__(item)
+        self.force_windows_path = force_windows_path
+
     def get_value(self, key, args, kwargs):
         ret = super().get_value(key, args, kwargs)
         if not isinstance(ret, str):
             return ret
-        return self.sanitize_path(ret)
+        return self.sanitize_path(ret, self.force_windows_path)
 
     @staticmethod
-    def sanitize_path(ret: str) -> str:
+    def sanitize_path(ret: str, force_windows_path: bool = False) -> str:
         """Replaces '/' with similar looking Division Slash and some other illegal filename characters on Windows."""
         ret = ret.replace('/', '\u2215')
-        if platform.system() == 'Windows':
+
+        if ret.startswith('.'):
+            ret = ret.replace('.', '\u2024', 1)
+
+        if force_windows_path or platform.system() == 'Windows':
             ret = ret.replace(':', '\uff1a').replace('<', '\ufe64').replace('>', '\ufe65').replace('\"', '\uff02')
             ret = ret.replace('\\', '\ufe68').replace('|', '\uff5c').replace('?', '\ufe16').replace('*', '\uff0a')
             ret = ret.replace('\n', ' ').replace('\r', ' ')
+            root, ext = os.path.splitext(ret)
+            if root.upper() in _PostPathFormatter.RESERVED:
+                root += '_'
+            if ext == '.':
+                ext = '\u2024'
+            ret = root + ext
         return ret
 
 
@@ -141,6 +179,9 @@ class Instaloader:
     :param user_agent: :option:`--user-agent`
     :param dirname_pattern: :option:`--dirname-pattern`, default is ``{target}``
     :param filename_pattern: :option:`--filename-pattern`, default is ``{date_utc}_UTC``
+    :param title_pattern:
+       :option:`--title-pattern`, default is ``{date_utc}_UTC_{typename}`` if ``dirname_pattern`` contains
+       ``{target}`` or ``{profile}``, ``{target}_{date_utc}_UTC_{typename}`` otherwise.
     :param download_pictures: not :option:`--no-pictures`
     :param download_videos: not :option:`--no-videos`
     :param download_video_thumbnails: not :option:`--no-video-thumbnails`
@@ -157,6 +198,10 @@ class Instaloader:
     :param rate_controller: Generator for a :class:`RateController` to override rate controlling behavior
     :param resume_prefix: :option:`--resume-prefix`, or None for :option:`--no-resume`.
     :param check_resume_bbd: Whether to check the date of expiry of resume files and reject them if expired.
+    :param slide: :option:`--slide`
+    :param fatal_status_codes: :option:`--abort-on`
+    :param iphone_support: not :option:`--no-iphone`
+    :param sanitize_paths: :option:`--sanitize-paths`
 
     .. attribute:: context
 
@@ -172,24 +217,39 @@ class Instaloader:
                  download_pictures=True,
                  download_videos: bool = True,
                  download_video_thumbnails: bool = True,
-                 download_geotags: bool = True,
-                 download_comments: bool = True,
+                 download_geotags: bool = False,
+                 download_comments: bool = False,
                  save_metadata: bool = True,
                  compress_json: bool = True,
-                 post_metadata_txt_pattern: str = None,
-                 storyitem_metadata_txt_pattern: str = None,
+                 post_metadata_txt_pattern: Optional[str] = None,
+                 storyitem_metadata_txt_pattern: Optional[str] = None,
                  max_connection_attempts: int = 3,
-                 request_timeout: Optional[float] = None,
+                 request_timeout: float = 300.0,
                  rate_controller: Optional[Callable[[InstaloaderContext], RateController]] = None,
                  resume_prefix: Optional[str] = "iterator",
-                 check_resume_bbd: bool = True):
+                 check_resume_bbd: bool = True,
+                 slide: Optional[str] = None,
+                 fatal_status_codes: Optional[List[int]] = None,
+                 iphone_support: bool = True,
+                 title_pattern: Optional[str] = None,
+                 sanitize_paths: bool = False):
 
         self.context = InstaloaderContext(sleep, quiet, user_agent, max_connection_attempts,
-                                          request_timeout, rate_controller)
+                                          request_timeout, rate_controller, fatal_status_codes,
+                                          iphone_support)
 
         # configuration parameters
         self.dirname_pattern = dirname_pattern or "{target}"
         self.filename_pattern = filename_pattern or "{date_utc}_UTC"
+        if title_pattern is not None:
+            self.title_pattern = title_pattern
+        else:
+            if (format_string_contains_key(self.dirname_pattern, 'profile') or
+                format_string_contains_key(self.dirname_pattern, 'target')):
+                self.title_pattern = '{date_utc}_UTC_{typename}'
+            else:
+                self.title_pattern = '{target}_{date_utc}_UTC_{typename}'
+        self.sanitize_paths = sanitize_paths
         self.download_pictures = download_pictures
         self.download_videos = download_videos
         self.download_video_thumbnails = download_video_thumbnails
@@ -203,6 +263,31 @@ class Instaloader:
             else storyitem_metadata_txt_pattern
         self.resume_prefix = resume_prefix
         self.check_resume_bbd = check_resume_bbd
+
+        self.slide = slide or ""
+        self.slide_start = 0
+        self.slide_end = -1
+        if self.slide != "":
+            splitted = self.slide.split('-')
+            if len(splitted) == 1:
+                if splitted[0] == 'last':
+                    # download only last image of a sidecar
+                    self.slide_start = -1
+                else:
+                    if int(splitted[0]) > 0:
+                        self.slide_start = self.slide_end = int(splitted[0])-1
+                    else:
+                        raise InvalidArgumentException("--slide parameter must be greater than 0.")
+            elif len(splitted) == 2:
+                if splitted[1] == 'last':
+                    self.slide_start = int(splitted[0])-1
+                elif 0 < int(splitted[0]) < int(splitted[1]):
+                    self.slide_start = int(splitted[0])-1
+                    self.slide_end = int(splitted[1])-1
+                else:
+                    raise InvalidArgumentException("Invalid data for --slide parameter.")
+            else:
+                raise InvalidArgumentException("Invalid data for --slide parameter.")
 
     @contextmanager
     def anonymous_copy(self):
@@ -225,7 +310,11 @@ class Instaloader:
             max_connection_attempts=self.context.max_connection_attempts,
             request_timeout=self.context.request_timeout,
             resume_prefix=self.resume_prefix,
-            check_resume_bbd=self.check_resume_bbd)
+            check_resume_bbd=self.check_resume_bbd,
+            slide=self.slide,
+            fatal_status_codes=self.context.fatal_status_codes,
+            iphone_support=self.context.iphone_support,
+            sanitize_paths=self.sanitize_paths)
         yield new_loader
         self.context.error_log.extend(new_loader.context.error_log)
         new_loader.context.error_log = []  # avoid double-printing of errors
@@ -246,15 +335,25 @@ class Instaloader:
                      filename_suffix: Optional[str] = None, _attempt: int = 1) -> bool:
         """Downloads and saves picture with given url under given directory with given timestamp.
         Returns true, if file was actually downloaded, i.e. updated."""
-        urlmatch = re.search('\\.[a-z0-9]*\\?', url)
-        file_extension = url[-3:] if urlmatch is None else urlmatch.group(0)[1:-1]
         if filename_suffix is not None:
             filename += '_' + filename_suffix
-        filename += '.' + file_extension
-        if os.path.isfile(filename):
+        urlmatch = re.search('\\.[a-z0-9]*\\?', url)
+        file_extension = url[-3:] if urlmatch is None else urlmatch.group(0)[1:-1]
+        nominal_filename = filename + '.' + file_extension
+        if os.path.isfile(nominal_filename):
+            self.context.log(nominal_filename + ' exists', end=' ', flush=True)
+            return False
+        resp = self.context.get_raw(url)
+        if 'Content-Type' in resp.headers and resp.headers['Content-Type']:
+            header_extension = '.' + resp.headers['Content-Type'].split(';')[0].split('/')[-1]
+            header_extension = header_extension.lower().replace('jpeg', 'jpg')
+            filename += header_extension
+        else:
+            filename = nominal_filename
+        if filename != nominal_filename and os.path.isfile(filename):
             self.context.log(filename + ' exists', end=' ', flush=True)
             return False
-        self.context.get_and_write_raw(url, filename)
+        self.context.write_raw(resp, filename)
         os.utime(filename, (datetime.now().timestamp(), mtime.timestamp()))
         return True
 
@@ -301,25 +400,54 @@ class Instaloader:
                             combined_answers.extend(y['answers'])
                         unique_comments_list[-1]['answers'] = get_unique_comments(combined_answers)
             return unique_comments_list
+
+        def get_new_comments(new_comments, start):
+            for idx, comment in enumerate(new_comments, start=start+1):
+                if idx % 250 == 0:
+                    self.context.log('{}'.format(idx), end='…', flush=True)
+                yield comment
+
+        def save_comments(extended_comments):
+            unique_comments = get_unique_comments(extended_comments, combine_answers=True)
+            answer_ids = set(int(answer['id']) for comment in unique_comments for answer in comment.get('answers', []))
+            with open(filename, 'w') as file:
+                file.write(json.dumps(list(filter(lambda t: int(t['id']) not in answer_ids, unique_comments)),
+                                      indent=4))
+
+        base_filename = filename
         filename += '_comments.json'
         try:
             with open(filename) as fp:
                 comments = json.load(fp)
         except (FileNotFoundError, json.decoder.JSONDecodeError):
             comments = list()
-        comments.extend(_postcomment_asdict(comment) for comment in post.get_comments())
+
+        comments_iterator = post.get_comments()
+        try:
+            with resumable_iteration(
+                    context=self.context,
+                    iterator=comments_iterator,
+                    load=load_structure_from_file,
+                    save=save_structure_to_file,
+                    format_path=lambda magic: "{}_{}_{}.json.xz".format(base_filename, self.resume_prefix, magic),
+                    check_bbd=self.check_resume_bbd,
+                    enabled=self.resume_prefix is not None
+            ) as (_is_resuming, start_index):
+                comments.extend(_postcomment_asdict(comment)
+                                for comment in get_new_comments(comments_iterator, start_index))
+        except (KeyboardInterrupt, AbortDownloadException):
+            if comments:
+                save_comments(comments)
+            raise
         if comments:
-            comments = get_unique_comments(comments, combine_answers=True)
-            answer_ids = set(int(answer['id']) for comment in comments for answer in comment.get('answers', []))
-            with open(filename, 'w') as file:
-                file.write(json.dumps(list(filter(lambda t: int(t['id']) not in answer_ids, comments)), indent=4))
+            save_comments(comments)
             self.context.log('comments', end=' ', flush=True)
 
     def save_caption(self, filename: str, mtime: datetime, caption: str) -> None:
         """Updates picture caption / Post metadata info"""
         def _elliptify(caption):
             pcaption = caption.replace('\n', ' ').strip()
-            return '[' + ((pcaption[:29] + u"\u2026") if len(pcaption) > 31 else pcaption) + ']'
+            return '[' + ((pcaption[:29] + "\u2026") if len(pcaption) > 31 else pcaption) + ']'
         filename += '.txt'
         caption += '\n'
         pcaption = _elliptify(caption)
@@ -350,17 +478,19 @@ class Instaloader:
             self.context.log(pcaption, end=' ', flush=True)
         except UnicodeEncodeError:
             self.context.log('txt', end=' ', flush=True)
-        with open(filename, 'wb') as text_file:
-            with BytesIO(bcaption) as bio:
-                shutil.copyfileobj(cast(IO, bio), text_file)
+        with open(filename, 'w', encoding='UTF-8') as fio:
+            fio.write(caption)
         os.utime(filename, (datetime.now().timestamp(), mtime.timestamp()))
 
     def save_location(self, filename: str, location: PostLocation, mtime: datetime) -> None:
         """Save post location name and Google Maps link."""
         filename += '_location.txt'
-        location_string = (location.name + "\n" +
-                           "https://maps.google.com/maps?q={0},{1}&ll={0},{1}\n".format(location.lat,
-                                                                                        location.lng))
+        if location.lat is not None and location.lng is not None:
+            location_string = (location.name + "\n" +
+                               "https://maps.google.com/maps?q={0},{1}&ll={0},{1}\n".format(location.lat,
+                                                                                            location.lng))
+        else:
+            location_string = location.name
         with open(filename, 'wb') as text_file:
             with BytesIO(location_string.encode()) as bio:
                 shutil.copyfileobj(cast(IO, bio), text_file)
@@ -393,30 +523,51 @@ class Instaloader:
 
         .. versionadded:: 4.3"""
 
-        def _epoch_to_string(epoch: datetime) -> str:
-            return epoch.strftime('%Y-%m-%d_%H-%M-%S_UTC')
-
         http_response = self.context.get_raw(url)
-        date_object = None  # type: Optional[datetime]
+        date_object: Optional[datetime] = None
         if 'Last-Modified' in http_response.headers:
             date_object = datetime.strptime(http_response.headers["Last-Modified"], '%a, %d %b %Y %H:%M:%S GMT')
+            date_object = date_object.replace(tzinfo=timezone.utc)
             pic_bytes = None
-            pic_identifier = _epoch_to_string(date_object)
         else:
             pic_bytes = http_response.content
-            pic_identifier = md5(pic_bytes).hexdigest()[:16]
-        filename = self.format_filename_within_target_path(target, owner_profile, pic_identifier, name_suffix, 'jpg')
+        ig_filename = url.split('/')[-1].split('?')[0]
+        pic_data = TitlePic(owner_profile, target, name_suffix, ig_filename, date_object)
+        dirname = _PostPathFormatter(pic_data, self.sanitize_paths).format(self.dirname_pattern, target=target)
+        filename_template = os.path.join(
+                dirname,
+                _PostPathFormatter(pic_data, self.sanitize_paths).format(self.title_pattern, target=target))
+        filename = self.__prepare_filename(filename_template, lambda: url) + ".jpg"
         content_length = http_response.headers.get('Content-Length', None)
         if os.path.isfile(filename) and (not self.context.is_logged_in or
                                          (content_length is not None and
                                           os.path.getsize(filename) >= int(content_length))):
             self.context.log(filename + ' already exists')
-            return None
+            return
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         self.context.write_raw(pic_bytes if pic_bytes else http_response, filename)
         if date_object:
             os.utime(filename, (datetime.now().timestamp(), date_object.timestamp()))
         self.context.log('')  # log output of _get_and_write_raw() does not produce \n
+
+    def download_profilepic_if_new(self, profile: Profile, latest_stamps: Optional[LatestStamps]) -> None:
+        """
+        Downloads and saves profile pic if it has not been downloaded before.
+
+        :param latest_stamps: Database with the last downloaded data. If not present,
+               the profile pic is downloaded unless it already exists
+
+        .. versionadded:: 4.8
+        """
+        if latest_stamps is None:
+            self.download_profilepic(profile)
+            return
+        profile_pic_basename = profile.profile_pic_url_no_iphone.split('/')[-1].split('?')[0]
+        saved_basename = latest_stamps.get_profile_pic(profile.username)
+        if saved_basename == profile_pic_basename:
+            return
+        self.download_profilepic(profile)
+        latest_stamps.set_profile_pic(profile.username, profile_pic_basename)
 
     def download_profilepic(self, profile: Profile) -> None:
         """Downloads and saves profile pic."""
@@ -433,6 +584,23 @@ class Instaloader:
 
         .. versionadded:: 4.4"""
         self.download_title_pic(hashtag.profile_pic_url, '#' + hashtag.name, 'profile_pic', None)
+
+    @_requires_login
+    def save_session(self) -> dict:
+        """Saves internally stored :class:`requests.Session` object to :class:`dict`.
+
+        :raises LoginRequiredException: If called without being logged in.
+
+        .. versionadded:: 4.10
+        """
+        return self.context.save_session()
+
+    def load_session(self, username: str, session_data: dict) -> None:
+        """Internally stores :class:`requests.Session` object from :class:`dict`.
+
+        .. versionadded:: 4.10
+        """
+        self.context.load_session(username, session_data)
 
     @_requires_login
     def save_session_to_file(self, filename: Optional[str] = None) -> None:
@@ -475,11 +643,16 @@ class Instaloader:
     def login(self, user: str, passwd: str) -> None:
         """Log in to instagram with given username and password and internally store session object.
 
-        :raises InvalidArgumentException: If the provided username does not exist.
         :raises BadCredentialsException: If the provided password is wrong.
-        :raises ConnectionException: If connection to Instagram failed.
         :raises TwoFactorAuthRequiredException: First step of 2FA login done, now call
-           :meth:`Instaloader.two_factor_login`."""
+           :meth:`Instaloader.two_factor_login`.
+        :raises LoginException: An error happened during login (for example, an invalid response was received).
+           Or if the provided username does not exist.
+
+        .. versionchanged:: 4.12
+           Raises LoginException instead of ConnectionException when an error happens.
+           Raises LoginException instead of InvalidArgumentException when the username does not exist.
+        """
         self.context.login(user, passwd)
 
     def two_factor_login(self, two_factor_code) -> None:
@@ -492,11 +665,25 @@ class Instaloader:
         .. versionadded:: 4.2"""
         self.context.two_factor_login(two_factor_code)
 
-    def format_filename(self, item: Union[Post, StoryItem], target: Optional[Union[str, Path]] = None):
+    @staticmethod
+    def __prepare_filename(filename_template: str, url: Callable[[], str]) -> str:
+        """Replace filename token inside filename_template with url's filename and assure the directories exist.
+
+        .. versionadded:: 4.6"""
+        if "{filename}" in filename_template:
+            filename = filename_template.replace("{filename}",
+                                                 os.path.splitext(os.path.basename(urlparse(url()).path))[0])
+        else:
+            filename = filename_template
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        return filename
+
+    def format_filename(self, item: Union[Post, StoryItem, PostSidecarNode, TitlePic],
+                        target: Optional[Union[str, Path]] = None):
         """Format filename of a :class:`Post` or :class:`StoryItem` according to ``filename-pattern`` parameter.
 
         .. versionadded:: 4.1"""
-        return _PostPathFormatter(item).format(self.filename_pattern, target=target)
+        return _PostPathFormatter(item, self.sanitize_paths).format(self.filename_pattern, target=target)
 
     def download_post(self, post: Post, target: Union[str, Path]) -> bool:
         """
@@ -507,32 +694,76 @@ class Instaloader:
         :return: True if something was downloaded, False otherwise, i.e. file was already there
         """
 
-        dirname = _PostPathFormatter(post).format(self.dirname_pattern, target=target)
-        filename = os.path.join(dirname, self.format_filename(post, target=target))
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        def _already_downloaded(path: str) -> bool:
+            if not os.path.isfile(path):
+                return False
+            else:
+                self.context.log(path + ' exists', end=' ', flush=True)
+                return True
+
+        def _all_already_downloaded(path_base, is_videos_enumerated) -> bool:
+            if '{filename}' in self.filename_pattern:
+                # full URL needed to evaluate actual filename, cannot determine at
+                # this point if all sidecar nodes were already downloaded.
+                return False
+            for idx, is_video in is_videos_enumerated:
+                if self.download_pictures and (not is_video or self.download_video_thumbnails):
+                    if not _already_downloaded("{0}_{1}.jpg".format(path_base, idx)):
+                        return False
+                if is_video and self.download_videos:
+                    if not _already_downloaded("{0}_{1}.mp4".format(path_base, idx)):
+                        return False
+            return True
+
+        dirname = _PostPathFormatter(post, self.sanitize_paths).format(self.dirname_pattern, target=target)
+        filename_template = os.path.join(dirname, self.format_filename(post, target=target))
+        filename = self.__prepare_filename(filename_template, lambda: post.url)
 
         # Download the image(s) / video thumbnail and videos within sidecars if desired
         downloaded = True
         if post.typename == 'GraphSidecar':
-            if self.download_pictures or self.download_videos:
-                for edge_number, sidecar_node in enumerate(post.get_sidecar_nodes(), start=1):
-                    if self.download_pictures and (not sidecar_node.is_video or self.download_video_thumbnails):
-                        # Download sidecar picture or video thumbnail (--no-pictures implies --no-video-thumbnails)
-                        downloaded &= self.download_pic(filename=filename, url=sidecar_node.display_url,
-                                                        mtime=post.date_local, filename_suffix=str(edge_number))
-                    if sidecar_node.is_video and self.download_videos:
-                        # Download sidecar video if desired
-                        downloaded &= self.download_pic(filename=filename, url=sidecar_node.video_url,
-                                                        mtime=post.date_local, filename_suffix=str(edge_number))
+            if (self.download_pictures or self.download_videos) and post.mediacount > 0:
+                if not _all_already_downloaded(
+                        filename_template, enumerate(
+                            (post.get_is_videos()[i]
+                             for i in range(self.slide_start % post.mediacount, self.slide_end % post.mediacount + 1)),
+                            start=self.slide_start % post.mediacount + 1
+                        )
+                ):
+                    for edge_number, sidecar_node in enumerate(
+                            post.get_sidecar_nodes(self.slide_start, self.slide_end),
+                            start=self.slide_start % post.mediacount + 1
+                    ):
+                        suffix: Optional[str] = str(edge_number)
+                        if '{filename}' in self.filename_pattern:
+                            suffix = None
+                        if self.download_pictures and (not sidecar_node.is_video or self.download_video_thumbnails):
+                            # pylint:disable=cell-var-from-loop
+                            sidecar_filename = self.__prepare_filename(filename_template,
+                                                                       lambda: sidecar_node.display_url)
+                            # Download sidecar picture or video thumbnail (--no-pictures implies --no-video-thumbnails)
+                            downloaded &= self.download_pic(filename=sidecar_filename, url=sidecar_node.display_url,
+                                                            mtime=post.date_local, filename_suffix=suffix)
+                        if sidecar_node.is_video and self.download_videos:
+                            # pylint:disable=cell-var-from-loop
+                            sidecar_filename = self.__prepare_filename(filename_template,
+                                                                       lambda: sidecar_node.video_url)
+                            # Download sidecar video if desired
+                            downloaded &= self.download_pic(filename=sidecar_filename, url=sidecar_node.video_url,
+                                                            mtime=post.date_local, filename_suffix=suffix)
+                else:
+                    downloaded = False
         elif post.typename == 'GraphImage':
             # Download picture
             if self.download_pictures:
-                downloaded = self.download_pic(filename=filename, url=post.url, mtime=post.date_local)
+                downloaded = (not _already_downloaded(filename + ".jpg") and
+                              self.download_pic(filename=filename, url=post.url, mtime=post.date_local))
         elif post.typename == 'GraphVideo':
             # Download video thumbnail (--no-pictures implies --no-video-thumbnails)
             if self.download_pictures and self.download_video_thumbnails:
                 with self.context.error_catcher("Video thumbnail of {}".format(post)):
-                    downloaded = self.download_pic(filename=filename, url=post.url, mtime=post.date_local)
+                    downloaded = (not _already_downloaded(filename + ".jpg") and
+                                  self.download_pic(filename=filename, url=post.url, mtime=post.date_local))
         else:
             self.context.error("Warning: {0} has unknown typename: {1}".format(post, post.typename))
 
@@ -543,7 +774,8 @@ class Instaloader:
 
         # Download video if desired
         if post.is_video and self.download_videos:
-            downloaded &= self.download_pic(filename=filename, url=post.video_url, mtime=post.date_local)
+            downloaded &= (not _already_downloaded(filename + ".mp4") and
+                           self.download_pic(filename=filename, url=post.video_url, mtime=post.date_local))
 
         # Download geotags if desired
         if self.download_geotags and post.location:
@@ -593,7 +825,8 @@ class Instaloader:
                          userids: Optional[List[Union[int, Profile]]] = None,
                          fast_update: bool = False,
                          filename_target: Optional[str] = ':stories',
-                         storyitem_filter: Optional[Callable[[StoryItem], bool]] = None) -> None:
+                         storyitem_filter: Optional[Callable[[StoryItem], bool]] = None,
+                         latest_stamps: Optional[LatestStamps] = None) -> None:
         """
         Download available stories from user followees or all stories of users whose ID are given.
         Does not mark stories as seen.
@@ -604,20 +837,38 @@ class Instaloader:
         :param filename_target: Replacement for {target} in dirname_pattern and filename_pattern
                or None if profile name should be used instead
         :param storyitem_filter: function(storyitem), which returns True if given StoryItem should be downloaded
+        :param latest_stamps: Database with the last times each user was scraped
         :raises LoginRequiredException: If called without being logged in.
+
+        .. versionchanged:: 4.8
+           Add `latest_stamps` parameter.
         """
 
         if not userids:
             self.context.log("Retrieving all visible stories...")
+            profile_count = None
         else:
             userids = [p if isinstance(p, int) else p.userid for p in userids]
+            profile_count = len(userids)
 
-        for user_story in self.get_stories(userids):
+        for i, user_story in enumerate(self.get_stories(userids), start=1):
             name = user_story.owner_username
-            self.context.log("Retrieving stories from profile {}.".format(name))
+            if profile_count is not None:
+                msg = "[{0:{w}d}/{1:{w}d}] Retrieving stories from profile {2}.".format(i, profile_count, name,
+                                                                                        w=len(str(profile_count)))
+            else:
+                msg = "[{:3d}] Retrieving stories from profile {}.".format(i, name)
+            self.context.log(msg)
             totalcount = user_story.itemcount
             count = 1
+            if latest_stamps is not None:
+                # pylint:disable=cell-var-from-loop
+                last_scraped = latest_stamps.get_last_story_timestamp(name)
+                scraped_timestamp = datetime.now().astimezone()
             for item in user_story.get_items():
+                if latest_stamps is not None:
+                    if item.date_local <= last_scraped:
+                        break
                 if storyitem_filter is not None and not storyitem_filter(item):
                     self.context.log("<{} skipped>".format(item), flush=True)
                     continue
@@ -627,6 +878,8 @@ class Instaloader:
                     downloaded = self.download_storyitem(item, filename_target if filename_target else name)
                     if fast_update and not downloaded:
                         break
+            if latest_stamps is not None:
+                latest_stamps.set_last_story_timestamp(name, scraped_timestamp)
 
     def download_storyitem(self, item: StoryItem, target: Union[str, Path]) -> bool:
         """Download one user story.
@@ -636,16 +889,30 @@ class Instaloader:
         :return: True if something was downloaded, False otherwise, i.e. file was already there
         """
 
+        def _already_downloaded(path: str) -> bool:
+            if not os.path.isfile(path):
+                return False
+            else:
+                self.context.log(path + ' exists', end=' ', flush=True)
+                return True
+
         date_local = item.date_local
-        dirname = _PostPathFormatter(item).format(self.dirname_pattern, target=target)
-        filename = os.path.join(dirname, self.format_filename(item, target=target))
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        dirname = _PostPathFormatter(item, self.sanitize_paths).format(self.dirname_pattern, target=target)
+        filename_template = os.path.join(dirname, self.format_filename(item, target=target))
+        filename = self.__prepare_filename(filename_template, lambda: item.url)
         downloaded = False
-        if not item.is_video or self.download_video_thumbnails is True:
-            url = item.url
-            downloaded = self.download_pic(filename=filename, url=url, mtime=date_local)
+        video_url_fetch_failed = False
         if item.is_video and self.download_videos is True:
-            downloaded |= self.download_pic(filename=filename, url=item.video_url, mtime=date_local)
+            video_url = item.video_url
+            if video_url:
+                filename = self.__prepare_filename(filename_template, lambda: str(video_url))
+                downloaded |= (not _already_downloaded(filename + ".mp4") and
+                               self.download_pic(filename=filename, url=video_url, mtime=date_local))
+            else:
+                video_url_fetch_failed = True
+        if video_url_fetch_failed or not item.is_video or self.download_video_thumbnails is True:
+            downloaded = (not _already_downloaded(filename + ".jpg") and
+                          self.download_pic(filename=filename, url=item.url, mtime=date_local))
         # Save caption if desired
         metadata_string = _ArbitraryItemFormatter(item).format(self.storyitem_metadata_txt_pattern).strip()
         if metadata_string:
@@ -701,10 +968,11 @@ class Instaloader:
         """
         for user_highlight in self.get_highlights(user):
             name = user_highlight.owner_username
-            highlight_target = (filename_target
+            highlight_target: Union[str, Path] = (filename_target
                                 if filename_target
-                                else (Path(_PostPathFormatter.sanitize_path(name)) /
-                                      _PostPathFormatter.sanitize_path(user_highlight.title)))  # type: Union[str, Path]
+                                else (Path(_PostPathFormatter.sanitize_path(name, self.sanitize_paths)) /
+                                      _PostPathFormatter.sanitize_path(user_highlight.title,
+                                                                       self.sanitize_paths)))
             self.context.log("Retrieving highlights \"{}\" from profile {}".format(user_highlight.title, name))
             self.download_highlight_cover(user_highlight, highlight_target)
             totalcount = user_highlight.itemcount
@@ -728,7 +996,9 @@ class Instaloader:
                             post_filter: Optional[Callable[[Post], bool]] = None,
                             max_count: Optional[int] = None,
                             total_count: Optional[int] = None,
-                            owner_profile: Optional[Profile] = None) -> None:
+                            owner_profile: Optional[Profile] = None,
+                            takewhile: Optional[Callable[[Post], bool]] = None,
+                            possibly_pinned: int = 0) -> None:
         """
         Download the Posts returned by given Post Iterator.
 
@@ -737,6 +1007,12 @@ class Instaloader:
         .. versionchanged:: 4.5
            Transparently resume an aborted operation if `posts` is a :class:`NodeIterator`.
 
+        .. versionchanged:: 4.8
+           Add `takewhile` parameter.
+
+        .. versionchanged:: 4.10.3
+           Add `possibly_pinned` parameter.
+
         :param posts: Post Iterator to loop through.
         :param target: Target name.
         :param fast_update: :option:`--fast-update`.
@@ -744,12 +1020,17 @@ class Instaloader:
         :param max_count: Maximum count of Posts to download (:option:`--count`).
         :param total_count: Total number of posts returned by given iterator.
         :param owner_profile: Associated profile, if any.
+        :param takewhile: Expression evaluated for each post. Once it returns false, downloading stops.
+        :param possibly_pinned: Number of posts that might be pinned. These posts do not cause download
+               to stop even if they've already been downloaded.
         """
         displayed_count = (max_count if total_count is None or max_count is not None and max_count < total_count
                            else total_count)
         sanitized_target = target
         if isinstance(target, str):
-            sanitized_target = _PostPathFormatter.sanitize_path(target)
+            sanitized_target = _PostPathFormatter.sanitize_path(target, self.sanitize_paths)
+        if takewhile is None:
+            takewhile = lambda _: True
         with resumable_iteration(
                 context=self.context,
                 iterator=posts,
@@ -762,7 +1043,10 @@ class Instaloader:
                 enabled=self.resume_prefix is not None
         ) as (is_resuming, start_index):
             for number, post in enumerate(posts, start=start_index + 1):
-                if max_count is not None and number > max_count:
+                should_stop = not takewhile(post)
+                if should_stop and number <= possibly_pinned:
+                    continue
+                if (max_count is not None and number > max_count) or should_stop:
                     break
                 if displayed_count is not None:
                     self.context.log("[{0:{w}d}/{1:{w}d}] ".format(number, displayed_count,
@@ -794,7 +1078,7 @@ class Instaloader:
                         except PostChangedException:
                             post_changed = True
                             continue
-                    if fast_update and not downloaded and not post_changed:
+                    if fast_update and not downloaded and not post_changed and number > possibly_pinned:
                         # disengage fast_update for first post when resuming
                         if not is_resuming or number > 0:
                             break
@@ -825,7 +1109,7 @@ class Instaloader:
                                                'has_stories': False})["data"]
 
     @_requires_login
-    def download_feed_posts(self, max_count: int = None, fast_update: bool = False,
+    def download_feed_posts(self, max_count: Optional[int] = None, fast_update: bool = False,
                             post_filter: Optional[Callable[[Post], bool]] = None) -> None:
         """
         Download pictures from the user's feed.
@@ -846,7 +1130,7 @@ class Instaloader:
         self.posts_download_loop(self.get_feed_posts(), ":feed", fast_update, post_filter, max_count=max_count)
 
     @_requires_login
-    def download_saved_posts(self, max_count: int = None, fast_update: bool = False,
+    def download_saved_posts(self, max_count: Optional[int] = None, fast_update: bool = False,
                              post_filter: Optional[Callable[[Post], bool]] = None) -> None:
         """Download user's saved pictures.
 
@@ -874,18 +1158,12 @@ class Instaloader:
         .. versionchanged:: 4.2.9
            Require being logged in (as required by Instagram)
         """
-        has_next_page = True
-        end_cursor = None
-        while has_next_page:
-            if end_cursor:
-                params = {'__a': 1, 'max_id': end_cursor}
-            else:
-                params = {'__a': 1}
-            location_data = self.context.get_json('explore/locations/{0}/'.format(location),
-                                                  params)['graphql']['location']['edge_location_to_media']
-            yield from (Post(self.context, edge['node']) for edge in location_data['edges'])
-            has_next_page = location_data['page_info']['has_next_page']
-            end_cursor = location_data['page_info']['end_cursor']
+        yield from SectionIterator(
+            self.context,
+            lambda d: d["native_location_data"]["recent"],
+            lambda m: Post.from_iphone_struct(self.context, m),
+            f"explore/locations/{location}/",
+        )
 
     @_requires_login
     def download_location(self, location: str,
@@ -934,9 +1212,10 @@ class Instaloader:
         """Get Posts associated with a #hashtag.
 
         .. deprecated:: 4.4
-           Use :meth:`Hashtag.get_posts`."""
-        return Hashtag.from_name(self.context, hashtag).get_posts()
+           Use :meth:`Hashtag.get_posts_resumable`."""
+        return Hashtag.from_name(self.context, hashtag).get_posts_resumable()
 
+    @_requires_login
     def download_hashtag(self, hashtag: Union[Hashtag, str],
                          max_count: Optional[int] = None,
                          post_filter: Optional[Callable[[Post], bool]] = None,
@@ -971,7 +1250,7 @@ class Instaloader:
                 self.download_hashtag_profilepic(hashtag)
         if posts:
             self.context.log("Retrieving pictures with hashtag #{}...".format(hashtag.name))
-            self.posts_download_loop(hashtag.get_all_posts(), target, fast_update, post_filter,
+            self.posts_download_loop(hashtag.get_posts_resumable(), target, fast_update, post_filter,
                                      max_count=max_count)
         if self.save_metadata:
             json_filename = '{0}/{1}'.format(self.dirname_pattern.format(profile=target,
@@ -981,25 +1260,72 @@ class Instaloader:
 
     def download_tagged(self, profile: Profile, fast_update: bool = False,
                         target: Optional[str] = None,
-                        post_filter: Optional[Callable[[Post], bool]] = None) -> None:
+                        post_filter: Optional[Callable[[Post], bool]] = None,
+                        latest_stamps: Optional[LatestStamps] = None) -> None:
         """Download all posts where a profile is tagged.
 
-        .. versionadded:: 4.1"""
+        .. versionadded:: 4.1
+
+        .. versionchanged:: 4.8
+           Add `latest_stamps` parameter."""
         self.context.log("Retrieving tagged posts for profile {}.".format(profile.username))
-        self.posts_download_loop(profile.get_tagged_posts(),
+        posts_takewhile: Optional[Callable[[Post], bool]] = None
+        if latest_stamps is not None:
+            last_scraped = latest_stamps.get_last_tagged_timestamp(profile.username)
+            posts_takewhile = lambda p: p.date_local > last_scraped
+        tagged_posts = profile.get_tagged_posts()
+        self.posts_download_loop(tagged_posts,
                                  target if target
-                                 else (Path(_PostPathFormatter.sanitize_path(profile.username)) /
-                                       _PostPathFormatter.sanitize_path(':tagged')),
-                                 fast_update, post_filter)
+                                 else (Path(_PostPathFormatter.sanitize_path(profile.username, self.sanitize_paths)) /
+                                       _PostPathFormatter.sanitize_path(':tagged', self.sanitize_paths)),
+                                 fast_update, post_filter, takewhile=posts_takewhile)
+        if latest_stamps is not None and tagged_posts.first_item is not None:
+            latest_stamps.set_last_tagged_timestamp(profile.username, tagged_posts.first_item.date_local)
+
+    def download_reels(self, profile: Profile, fast_update: bool = False,
+                      post_filter: Optional[Callable[[Post], bool]] = None,
+                      latest_stamps: Optional[LatestStamps] = None) -> None:
+        """Download reels videos of a profile.
+
+        .. versionadded:: 4.14.0
+
+        """
+        self.context.log("Retrieving reels videos for profile {}.".format(profile.username))
+        posts_takewhile: Optional[Callable[[Post], bool]] = None
+        if latest_stamps is not None:
+            last_scraped = latest_stamps.get_last_reels_timestamp(profile.username)
+            posts_takewhile = lambda p: p.date_local > last_scraped
+        reels = profile.get_reels()
+        self.posts_download_loop(
+            reels,
+            profile.username,
+            fast_update,
+            post_filter,
+            owner_profile=profile,
+            takewhile=posts_takewhile,
+        )
+        if latest_stamps is not None and reels.first_item is not None:
+            latest_stamps.set_last_reels_timestamp(profile.username, reels.first_item.date_local)
 
     def download_igtv(self, profile: Profile, fast_update: bool = False,
-                      post_filter: Optional[Callable[[Post], bool]] = None) -> None:
+                      post_filter: Optional[Callable[[Post], bool]] = None,
+                      latest_stamps: Optional[LatestStamps] = None) -> None:
         """Download IGTV videos of a profile.
 
-        .. versionadded:: 4.3"""
+        .. versionadded:: 4.3
+
+        .. versionchanged:: 4.8
+           Add `latest_stamps` parameter."""
         self.context.log("Retrieving IGTV videos for profile {}.".format(profile.username))
-        self.posts_download_loop(profile.get_igtv_posts(), profile.username, fast_update, post_filter,
-                                 total_count=profile.igtvcount, owner_profile=profile)
+        posts_takewhile: Optional[Callable[[Post], bool]] = None
+        if latest_stamps is not None:
+            last_scraped = latest_stamps.get_last_igtv_timestamp(profile.username)
+            posts_takewhile = lambda p: p.date_local > last_scraped
+        igtv_posts = profile.get_igtv_posts()
+        self.posts_download_loop(igtv_posts, profile.username, fast_update, post_filter,
+                                 total_count=profile.igtvcount, owner_profile=profile, takewhile=posts_takewhile)
+        if latest_stamps is not None and igtv_posts.first_item is not None:
+            latest_stamps.set_last_igtv_timestamp(profile.username, igtv_posts.first_item.date_local)
 
     def _get_id_filename(self, profile_name: str) -> str:
         if ((format_string_contains_key(self.dirname_pattern, 'profile') or
@@ -1011,9 +1337,22 @@ class Instaloader:
             return os.path.join(self.dirname_pattern.format(),
                                 '{0}_id'.format(profile_name.lower()))
 
+    def load_profile_id(self, profile_name: str) -> Optional[int]:
+        """
+        Load ID of profile from profile directory.
+
+        .. versionadded:: 4.8
+        """
+        id_filename = self._get_id_filename(profile_name)
+        try:
+            with open(id_filename, 'rb') as id_file:
+                return int(id_file.read())
+        except (FileNotFoundError, ValueError):
+            return None
+
     def save_profile_id(self, profile: Profile):
         """
-        Store ID of profile locally.
+        Store ID of profile on profile directory.
 
         .. versionadded:: 4.0.6
         """
@@ -1023,13 +1362,18 @@ class Instaloader:
             text_file.write(str(profile.userid) + "\n")
             self.context.log("Stored ID {0} for profile {1}.".format(profile.userid, profile.username))
 
-    def check_profile_id(self, profile_name: str) -> Profile:
+    def check_profile_id(self, profile_name: str, latest_stamps: Optional[LatestStamps] = None) -> Profile:
         """
         Consult locally stored ID of profile with given name, check whether ID matches and whether name
         has changed and return current name of the profile, and store ID of profile.
 
         :param profile_name: Profile name
+        :param latest_stamps: Database of downloaded data. If present, IDs are retrieved from it,
+               otherwise from the target directory
         :return: Instance of current profile
+
+        .. versionchanged:: 4.8
+           Add `latest_stamps` parameter.
         """
         profile = None
         profile_name_not_exists_err = None
@@ -1037,10 +1381,11 @@ class Instaloader:
             profile = Profile.from_username(self.context, profile_name)
         except ProfileNotExistsException as err:
             profile_name_not_exists_err = err
-        id_filename = self._get_id_filename(profile_name)
-        try:
-            with open(id_filename, 'rb') as id_file:
-                profile_id = int(id_file.read())
+        if latest_stamps is None:
+            profile_id = self.load_profile_id(profile_name)
+        else:
+            profile_id = latest_stamps.get_profile_id(profile_name)
+        if profile_id is not None:
             if (profile is None) or \
                     (profile_id != profile.userid):
                 if profile is not None:
@@ -1051,23 +1396,31 @@ class Instaloader:
                                                                                                   profile_id))
                 profile_from_id = Profile.from_id(self.context, profile_id)
                 newname = profile_from_id.username
-                self.context.log("Profile {0} has changed its name to {1}.".format(profile_name, newname))
-                if ((format_string_contains_key(self.dirname_pattern, 'profile') or
-                     format_string_contains_key(self.dirname_pattern, 'target'))):
-                    os.rename(self.dirname_pattern.format(profile=profile_name.lower(),
-                                                          target=profile_name.lower()),
-                              self.dirname_pattern.format(profile=newname.lower(),
-                                                          target=newname.lower()))
+                if profile_name == newname:
+                    self.context.error(
+                        f"Warning: Profile {profile_name} could not be retrieved by its name, but by its ID.")
+                    return profile_from_id
+                self.context.error("Profile {0} has changed its name to {1}.".format(profile_name, newname))
+                if latest_stamps is None:
+                    if ((format_string_contains_key(self.dirname_pattern, 'profile') or
+                         format_string_contains_key(self.dirname_pattern, 'target'))):
+                        os.rename(self.dirname_pattern.format(profile=profile_name.lower(),
+                                                              target=profile_name.lower()),
+                                  self.dirname_pattern.format(profile=newname.lower(),
+                                                              target=newname.lower()))
+                    else:
+                        os.rename('{0}/{1}_id'.format(self.dirname_pattern.format(), profile_name.lower()),
+                                  '{0}/{1}_id'.format(self.dirname_pattern.format(), newname.lower()))
                 else:
-                    os.rename('{0}/{1}_id'.format(self.dirname_pattern.format(), profile_name.lower()),
-                              '{0}/{1}_id'.format(self.dirname_pattern.format(), newname.lower()))
+                    latest_stamps.rename_profile(profile_name, newname)
                 return profile_from_id
             # profile exists and profile id matches saved id
             return profile
-        except (FileNotFoundError, ValueError):
-            pass
         if profile is not None:
-            self.save_profile_id(profile)
+            if latest_stamps is None:
+                self.save_profile_id(profile)
+            else:
+                latest_stamps.save_profile_id(profile.username, profile.userid)
             return profile
         if profile_name_not_exists_err:
             raise profile_name_not_exists_err
@@ -1082,7 +1435,10 @@ class Instaloader:
                           fast_update: bool = False,
                           post_filter: Optional[Callable[[Post], bool]] = None,
                           storyitem_filter: Optional[Callable[[Post], bool]] = None,
-                          raise_errors: bool = False):
+                          raise_errors: bool = False,
+                          latest_stamps: Optional[LatestStamps] = None,
+                          max_count: Optional[int] = None,
+                          reels: bool = False):
         """High-level method to download set of profiles.
 
         :param profiles: Set of profiles to download.
@@ -1098,11 +1454,23 @@ class Instaloader:
         :param raise_errors:
            Whether :exc:`LoginRequiredException` and :exc:`PrivateProfileNotFollowedException` should be raised or
            catched and printed with :meth:`InstaloaderContext.error_catcher`.
+        :param latest_stamps: :option:`--latest-stamps`.
+        :param max_count: Maximum count of posts to download.
+        :param reels: :option:`--reels`.
 
         .. versionadded:: 4.1
 
         .. versionchanged:: 4.3
            Add `igtv` parameter.
+
+        .. versionchanged:: 4.8
+           Add `latest_stamps` parameter.
+
+        .. versionchanged:: 4.13
+           Add `max_count` parameter.
+
+        .. versionchanged:: 4.14
+           Add `reels` parameter.
         """
 
         @contextmanager
@@ -1112,14 +1480,16 @@ class Instaloader:
         # error_handler type is Callable[[Optional[str]], ContextManager[None]] (not supported with Python 3.5.0..3.5.3)
         error_handler = _error_raiser if raise_errors else self.context.error_catcher
 
-        for profile in profiles:
+        for i, profile in enumerate(profiles, start=1):
+            self.context.log("[{0:{w}d}/{1:{w}d}] Downloading profile {2}".format(i, len(profiles), profile.username,
+                                                                                  w=len(str(len(profiles)))))
             with error_handler(profile.username):  # type: ignore # (ignore type for Python 3.5 support)
                 profile_name = profile.username
 
                 # Download profile picture
                 if profile_pic:
                     with self.context.error_catcher('Download profile picture of {}'.format(profile_name)):
-                        self.download_profilepic(profile)
+                        self.download_profilepic_if_new(profile, latest_stamps)
 
                 # Save metadata as JSON if desired.
                 if self.save_metadata:
@@ -1132,7 +1502,7 @@ class Instaloader:
                 if tagged or igtv or highlights or posts:
                     if (not self.context.is_logged_in and
                             profile.is_private):
-                        raise LoginRequiredException("--login=USERNAME required.")
+                        raise LoginRequiredException("Login required.")
                     if (self.context.username != profile.username and
                             profile.is_private and
                             not profile.followed_by_viewer):
@@ -1141,12 +1511,20 @@ class Instaloader:
                 # Download tagged, if requested
                 if tagged:
                     with self.context.error_catcher('Download tagged of {}'.format(profile_name)):
-                        self.download_tagged(profile, fast_update=fast_update, post_filter=post_filter)
+                        self.download_tagged(profile, fast_update=fast_update, post_filter=post_filter,
+                                             latest_stamps=latest_stamps)
+
+                # Download reels, if requested
+                if reels:
+                    with self.context.error_catcher('Download reels of {}'.format(profile_name)):
+                        self.download_reels(profile, fast_update=fast_update, post_filter=post_filter,
+                                           latest_stamps=latest_stamps)
 
                 # Download IGTV, if requested
                 if igtv:
                     with self.context.error_catcher('Download IGTV of {}'.format(profile_name)):
-                        self.download_igtv(profile, fast_update=fast_update, post_filter=post_filter)
+                        self.download_igtv(profile, fast_update=fast_update, post_filter=post_filter,
+                                           latest_stamps=latest_stamps)
 
                 # Download highlights, if requested
                 if highlights:
@@ -1156,14 +1534,24 @@ class Instaloader:
                 # Iterate over pictures and download them
                 if posts:
                     self.context.log("Retrieving posts from profile {}.".format(profile_name))
-                    self.posts_download_loop(profile.get_posts(), profile_name, fast_update, post_filter,
-                                             total_count=profile.mediacount, owner_profile=profile)
+                    posts_takewhile: Optional[Callable[[Post], bool]] = None
+                    if latest_stamps is not None:
+                        # pylint:disable=cell-var-from-loop
+                        last_scraped = latest_stamps.get_last_post_timestamp(profile_name)
+                        posts_takewhile = lambda p: p.date_local > last_scraped
+                    posts_to_download = profile.get_posts()
+                    self.posts_download_loop(posts_to_download, profile_name, fast_update, post_filter,
+                                             total_count=profile.mediacount, owner_profile=profile,
+                                             takewhile=posts_takewhile, possibly_pinned=3, max_count=max_count)
+                    if latest_stamps is not None and posts_to_download.first_item is not None:
+                        latest_stamps.set_last_post_timestamp(profile_name,
+                                                              posts_to_download.first_item.date_local)
 
         if stories and profiles:
             with self.context.error_catcher("Download stories"):
                 self.context.log("Downloading stories")
                 self.download_stories(userids=list(profiles), fast_update=fast_update, filename_target=None,
-                                      storyitem_filter=storyitem_filter)
+                                      storyitem_filter=storyitem_filter, latest_stamps=latest_stamps)
 
     def download_profile(self, profile_name: Union[str, Profile],
                          profile_pic: bool = True, profile_pic_only: bool = False,
@@ -1242,11 +1630,16 @@ class Instaloader:
     def interactive_login(self, username: str) -> None:
         """Logs in and internally stores session, asking user for password interactively.
 
-        :raises LoginRequiredException: when in quiet mode.
-        :raises InvalidArgumentException: If the provided username does not exist.
-        :raises ConnectionException: If connection to Instagram failed."""
+        :raises InvalidArgumentException: when in quiet mode.
+        :raises LoginException: If the provided username does not exist.
+        :raises ConnectionException: If connection to Instagram failed.
+
+        .. versionchanged:: 4.12
+           Raises InvalidArgumentException instead of LoginRequiredException when in quiet mode.
+           Raises LoginException instead of InvalidArgumentException when the username does not exist.
+        """
         if self.context.quiet:
-            raise LoginRequiredException("Quiet mode requires given password or valid session file.")
+            raise InvalidArgumentException("Quiet mode requires given password or valid session file.")
         try:
             password = None
             while password is None:
@@ -1262,5 +1655,13 @@ class Instaloader:
                     code = input("Enter 2FA verification code: ")
                     self.two_factor_login(code)
                     break
-                except BadCredentialsException:
+                except BadCredentialsException as err:
+                    print(err, file=sys.stderr)
                     pass
+
+    @property
+    def has_stored_errors(self) -> bool:
+        """Returns whether any error has been reported and stored to be repeated at program termination.
+
+        .. versionadded: 4.12"""
+        return self.context.has_stored_errors

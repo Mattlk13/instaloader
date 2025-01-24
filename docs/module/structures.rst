@@ -2,7 +2,7 @@ Instagram Structures
 ^^^^^^^^^^^^^^^^^^^^
 
 .. module:: instaloader
-   :noindex:
+   :no-index:
 
 .. highlight:: python
 
@@ -71,12 +71,30 @@ TopSearchResults
 
    .. versionadded:: 4.3
 
+TitlePic
+""""""""
+
+.. autoclass:: TitlePic
+   :no-show-inheritance:
+
+   .. versionadded:: 4.8
+
 Loading and Saving
 """"""""""""""""""
 
 :class:`Post`, :class:`StoryItem`, :class:`Profile`, :class:`Hashtag` and
 :class:`FrozenNodeIterator` can be saved and loaded to/from JSON files.
 
+.. autofunction:: load_structure
+
 .. autofunction:: load_structure_from_file
 
+.. autofunction:: get_json_structure
+
 .. autofunction:: save_structure_to_file
+
+LatestStamps
+""""""""""""
+
+.. autoclass:: LatestStamps
+   :no-show-inheritance:

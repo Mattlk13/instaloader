@@ -33,7 +33,11 @@ class LoginRequiredException(InstaloaderException):
     pass
 
 
-class TwoFactorAuthRequiredException(InstaloaderException):
+class LoginException(InstaloaderException):
+    pass
+
+
+class TwoFactorAuthRequiredException(LoginException):
     pass
 
 
@@ -45,7 +49,7 @@ class BadResponseException(InstaloaderException):
     pass
 
 
-class BadCredentialsException(InstaloaderException):
+class BadCredentialsException(LoginException):
     pass
 
 
@@ -63,4 +67,18 @@ class QueryReturnedNotFoundException(ConnectionException):
 
 
 class TooManyRequestsException(ConnectionException):
+    pass
+
+class IPhoneSupportDisabledException(InstaloaderException):
+    pass
+
+class AbortDownloadException(Exception):
+    """
+    Exception that is not catched in the error catchers inside the download loop and so aborts the
+    download loop.
+
+    This exception is not a subclass of ``InstaloaderException``.
+
+    .. versionadded:: 4.7
+    """
     pass
